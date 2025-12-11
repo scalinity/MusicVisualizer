@@ -111,10 +111,7 @@ class Visualizer:
         pygame.init()
         pygame.display.set_caption("3D Music Visualizer")
         
-        # Enable Multisampling (MSAA) to fix aliasing/banding at distance
-        pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLEBUFFERS, 1)
-        pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLESAMPLES, 4)
-        
+        # MSAA disabled - causes black screen on some virtual GPU drivers (virgl)
         self.screen = pygame.display.set_mode((width, height), DOUBLEBUF | OPENGL | RESIZABLE)
 
         # Audio device management
@@ -129,13 +126,15 @@ class Visualizer:
         self.init_gl()
 
     def init_gl(self):
+        # Set background color (dark blue-gray) so we can tell if OpenGL is working
+        glClearColor(0.05, 0.05, 0.1, 1.0)
+
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_LIGHTING)
         glEnable(GL_LIGHT0)
         glEnable(GL_COLOR_MATERIAL)
         glEnable(GL_BLEND)
         glEnable(GL_NORMALIZE) # Fix lighting for scaled objects
-        glEnable(GL_MULTISAMPLE) # Enable MSAA in OpenGL
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glShadeModel(GL_SMOOTH) # Ensure smooth shading
         
@@ -229,12 +228,13 @@ class Visualizer:
                                           min(self.CAMERA_MAX_DISTANCE,
                                               self.camera_distance - zoom_delta))
             elif event.type == pygame.VIDEORESIZE:
-                # Handle window resize
-                self.width = event.w
-                self.height = event.h
-                self.screen = pygame.display.set_mode((self.width, self.height),
-                                                      DOUBLEBUF | OPENGL | RESIZABLE)
-                self._setup_viewport()
+                # Handle window resize (only in windowed mode)
+                if not self.fullscreen:
+                    self.width = event.w
+                    self.height = event.h
+                    self.screen = pygame.display.set_mode((self.width, self.height),
+                                                          DOUBLEBUF | OPENGL | RESIZABLE)
+                    self._setup_viewport()
             elif event.type == pygame.MOUSEMOTION:
                 if not self.auto_rotate and event.buttons[0]:  # Left mouse button held
                     self.camera_rotation += event.rel[0] * self.MOUSE_ROTATION_SENSITIVITY
@@ -541,7 +541,10 @@ class Visualizer:
 
         # Render
         start_x = -(cols * width_step) / 2
-        start_z = -(rows * depth_step) / 2
+        # Fix: Shift terrain back so it doesn't clip behind camera (Camera Z=30)
+        # Original: start_z = -(rows * depth_step) / 2  -> Range [-36, 36] -> Newest at +36 (Behind cam)
+        # New: Shift so newest is at Z=0.
+        start_z = -(rows * depth_step)
 
         glPushMatrix()
         glTranslatef(start_x, self.TERRAIN_Y_OFFSET, start_z)

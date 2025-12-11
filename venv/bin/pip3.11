@@ -1,4 +1,4 @@
-#!/home/scalinitybio/Code/Antigravity/MusicFX/venv/bin/python3
+#!/home/scalinitybio/Code/Antigravity/MusicFX/venv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys
