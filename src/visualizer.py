@@ -51,6 +51,7 @@ class Visualizer:
     MODE_BARS = 0
     MODE_TERRAIN = 1
     MODE_CIRCULAR = 2
+    MODE_STEREO = 3
 
     # Camera constants
     DEFAULT_CAMERA_DISTANCE = 30
@@ -61,12 +62,12 @@ class Visualizer:
     MOUSE_ROTATION_SENSITIVITY = 0.5
 
     # Sensitivity constants
-    DEFAULT_SENSITIVITY = 1.0
+    DEFAULT_SENSITIVITY = 5.0
     SENSITIVITY_STEP = 0.1
     MIN_SENSITIVITY = 0.1
 
     # History for terrain mode
-    TERRAIN_HISTORY_LENGTH = 60
+    TERRAIN_HISTORY_LENGTH = 180
     TERRAIN_WIDTH_STEP = 1.0  # Spacing between frequency bands
     TERRAIN_DEPTH_STEP = 0.4  # Spacing between history rows
     TERRAIN_HEIGHT_SCALE = 1.5  # Vertical scaling for audio amplitude
@@ -86,6 +87,7 @@ class Visualizer:
         # Camera parameters
         self.camera_distance = self.DEFAULT_CAMERA_DISTANCE
         self.camera_rotation = 0
+        self.camera_pitch = 0
         self.auto_rotate = True
 
         # History for Terrain Mode
@@ -108,6 +110,11 @@ class Visualizer:
         # Initialize PyGame
         pygame.init()
         pygame.display.set_caption("3D Music Visualizer")
+        
+        # Enable Multisampling (MSAA) to fix aliasing/banding at distance
+        pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLEBUFFERS, 1)
+        pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLESAMPLES, 4)
+        
         self.screen = pygame.display.set_mode((width, height), DOUBLEBUF | OPENGL | RESIZABLE)
 
         # Audio device management
@@ -127,13 +134,21 @@ class Visualizer:
         glEnable(GL_LIGHT0)
         glEnable(GL_COLOR_MATERIAL)
         glEnable(GL_BLEND)
+        glEnable(GL_NORMALIZE) # Fix lighting for scaled objects
+        glEnable(GL_MULTISAMPLE) # Enable MSAA in OpenGL
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glShadeModel(GL_SMOOTH) # Ensure smooth shading
+        
+        # Disable Specular Highlights (Matte Finish) to prevent "washed out" white glare on sides
+        glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, (0.0, 0.0, 0.0, 1.0))
+        glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 0.0)
 
-        # Light position
-        glLightfv(GL_LIGHT0, GL_POSITION,  (0, 20, 20, 0))
-        glLightfv(GL_LIGHT0, GL_AMBIENT, (0.2, 0.2, 0.2, 1.0))
-        glLightfv(GL_LIGHT0, GL_DIFFUSE, (0.8, 0.8, 0.8, 1.0))
+        # Light 0: Centered for Symmetry
+        glLightfv(GL_LIGHT0, GL_POSITION,  (0, 20, 15, 0))
+        # "Rich Color" Lighting: Moderate Ambient (0.5) + Moderate Diffuse (0.5)
+        # This prevents the "Pastel/Flat" look of high ambient, while keeping enough light for depth
+        glLightfv(GL_LIGHT0, GL_AMBIENT, (0.5, 0.5, 0.5, 1.0)) 
+        glLightfv(GL_LIGHT0, GL_DIFFUSE, (0.5, 0.5, 0.5, 1.0))
 
         # Setup viewport and perspective
         self._setup_viewport()
@@ -147,7 +162,8 @@ class Visualizer:
         glViewport(0, 0, self.width, self.height)
         glMatrixMode(GL_PROJECTION)
         glLoadIdentity()
-        gluPerspective(45, (self.width / self.height), 0.1, 300.0)
+        # Increased zNear from 0.1 to 1.0 to improve depth buffer precision at distance
+        gluPerspective(45, (self.width / self.height), 1.0, 300.0)
         glMatrixMode(GL_MODELVIEW)
 
     def _toggle_fullscreen(self):
@@ -187,7 +203,7 @@ class Visualizer:
                 if event.key == pygame.K_ESCAPE:
                     self.running = False
                 elif event.key == pygame.K_SPACE:
-                    self.mode = (self.mode + 1) % 3
+                    self.mode = (self.mode + 1) % 4
                 elif event.key == pygame.K_UP:
                     self.camera_distance = max(self.CAMERA_MIN_DISTANCE,
                                                self.camera_distance - self.CAMERA_ZOOM_STEP)
@@ -222,28 +238,49 @@ class Visualizer:
             elif event.type == pygame.MOUSEMOTION:
                 if not self.auto_rotate and event.buttons[0]:  # Left mouse button held
                     self.camera_rotation += event.rel[0] * self.MOUSE_ROTATION_SENSITIVITY
+                    self.camera_pitch += event.rel[1] * self.MOUSE_ROTATION_SENSITIVITY
+                    
+                    # Optional: Clamp pitch to avoid flipping upside down
+                    self.camera_pitch = max(-90.0, min(90.0, self.camera_pitch))
                     
     def update(self):
         if self.paused:
             return self.history[-1] if self.history else np.zeros(64)
             
-        # Get audio data
-        raw_bands = self.analyzer.read_audio() * self.sensitivity
+        # Get audio data - stereo (2, 64)
+        raw_stereo = self.analyzer.read_audio() * self.sensitivity
         
-        # Improve smoothness: Spatial smoothing
-        # Simple 3-point moving average
-        bands = np.zeros_like(raw_bands)
-        for i in range(len(raw_bands)):
-            prev = raw_bands[i-1] if i > 0 else raw_bands[i]
-            curr = raw_bands[i]
-            next_val = raw_bands[i+1] if i < len(raw_bands)-1 else raw_bands[i]
-            bands[i] = (prev + curr * 2 + next_val) / 4
-            
-        # Update history
+        # Force Symmetry: Average Left and Right channels
+        # This solves the "one side more active" issue for panned audio
+        stereo_mean = np.mean(raw_stereo, axis=0)
+        raw_stereo[0] = stereo_mean
+        raw_stereo[1] = stereo_mean
+        
+        # Smooth stereo bands
+        bands_stereo = np.zeros_like(raw_stereo)
+        
+        for ch in range(2):
+            raw_bands = raw_stereo[ch]
+            # Simple 3-point moving average for each channel
+            smoothed = np.zeros_like(raw_bands)
+            for i in range(len(raw_bands)):
+                prev = raw_bands[i-1] if i > 0 else raw_bands[i]
+                curr = raw_bands[i]
+                next_val = raw_bands[i+1] if i < len(raw_bands)-1 else raw_bands[i]
+                smoothed[i] = (prev + curr * 2 + next_val) / 4
+            bands_stereo[ch] = smoothed
+
+        # Create mono mix for history and standard modes
+        mono_bands = np.mean(bands_stereo, axis=0)
+
+        # Update history with mono bands (for terrain)
         self.history.pop(0)
-        self.history.append(bands)
+        self.history.append(mono_bands)
         
-        return bands
+        if self.mode == self.MODE_STEREO:
+            return bands_stereo
+        else:
+            return mono_bands
         
     def draw_text_overlay(self):
         glMatrixMode(GL_PROJECTION)
@@ -256,7 +293,7 @@ class Visualizer:
         glDisable(GL_DEPTH_TEST)
         glDisable(GL_LIGHTING)
 
-        mode_names = ["Bars", "Terrain", "Vortex"]
+        mode_names = ["Bars", "Terrain", "Vortex", "Stereo"]
         device_name = self.analyzer.get_current_device_name()
         # Truncate device name if too long
         if len(device_name) > 25:
@@ -295,6 +332,8 @@ class Visualizer:
         start_x = -total_width / 2
         
         self._enable_cube_vbo()
+
+        # Lighting Enabled (Standard)
 
         # Draw reflection
         glPushMatrix()
@@ -579,6 +618,133 @@ class Visualizer:
 
         self._disable_cube_vbo()
 
+    def draw_stereo_bars(self, stereo_bands):
+        # Stereo Mode: Left Channel on Left, Right Channel on Right
+        # stereo_bands shape: (2, 64)
+        
+        
+        left_bands = stereo_bands[0]
+        right_bands = stereo_bands[1]
+        
+        # Lighting Enabled (Standard)
+        
+        num_bars = len(left_bands)
+        spacing = 0.8
+        
+        # Calculate total width for one channel
+        channel_width = num_bars * spacing
+        
+        # Offset to separate channels
+        center_gap = 2.0
+        
+        self._enable_cube_vbo()
+        
+        # --- Reflection Pass (Draw First) ---
+        glPushMatrix()
+        glScalef(1, -1, 1)
+        glTranslatef(0, 0.1, 0) # Slight offset
+        
+        # Unified Center Gap (minimal)
+        center_gap = 0.0
+        
+        # Reflection: Left Channel
+        start_x_left = -center_gap / 2
+        for i, band in enumerate(left_bands):
+            height = (band ** 0.7) * 1.5
+            if height < 0.2: height = 0.2
+            x = start_x_left - i * spacing
+            
+            glPushMatrix()
+            glTranslatef(x, 0, 0)
+            
+            # Gradient: Center Purple (0.5, 0.0, 1.0) -> Edge Cyan (0.0, 1.0, 1.0)
+            t = i / num_bars
+            r = 0.5 * (1 - t)
+            g = t
+            b = 1.0
+            
+            glColor4f(r, g, b, 0.3) # Fainter reflection
+            glScalef(0.6, height, 0.6)
+            glTranslatef(0, 0.5, 0)
+            self.draw_cube_fast()
+            glPopMatrix()
+
+        # Reflection: Right Channel
+        start_x_right = center_gap / 2
+        for i, band in enumerate(right_bands):
+            height = (band ** 0.7) * 1.5
+            if height < 0.2: height = 0.2
+            x = start_x_right + i * spacing
+            
+            glPushMatrix()
+            glTranslatef(x, 0, 0)
+            
+            # Gradient: Center Purple (0.5, 0.0, 1.0) -> Edge Orange (1.0, 0.5, 0.0)
+            t = i / num_bars
+            r = 0.5 + 0.5 * t
+            g = 0.5 * t
+            b = 1.0 * (1 - t)
+            
+            glColor4f(r, g, b, 0.3) # Fainter reflection
+            glScalef(0.6, height, 0.6)
+            glTranslatef(0, 0.5, 0)
+            self.draw_cube_fast()
+            glPopMatrix()
+            
+        glPopMatrix()
+        
+        # --- End Reflection Pass ---
+        
+        # Draw Left Channel (Mirrored: Bass at Center, Treble at Left)
+        # Unified Center
+        start_x_left = -center_gap / 2
+        
+        for i, band in enumerate(left_bands):
+            height = (band ** 0.7) * 1.5
+            if height < 0.2: height = 0.2
+            # Go left: -x
+            x = start_x_left - i * spacing
+            
+            glPushMatrix()
+            glTranslatef(x, 0, 0)
+            
+            # Gradient: Center Purple (0.5, 0.0, 1.0) -> Edge Cyan (0.0, 1.0, 1.0)
+            t = i / num_bars
+            r = 0.5 * (1 - t)
+            g = t
+            b = 1.0
+            
+            glColor3f(r, g, b)
+            glScalef(0.6, height, 0.6)
+            glTranslatef(0, 0.5, 0)
+            self.draw_cube_fast()
+            glPopMatrix()
+
+        # Draw Right Channel (Standard from center-gap)
+        start_x_right = center_gap / 2
+        
+        for i, band in enumerate(right_bands):
+            height = (band ** 0.7) * 1.5
+            if height < 0.2: height = 0.2
+            x = start_x_right + i * spacing
+            
+            glPushMatrix()
+            glTranslatef(x, 0, 0)
+            
+            # Gradient: Center Purple (0.5, 0.0, 1.0) -> Edge Orange (1.0, 0.5, 0.0)
+            t = i / num_bars
+            r = 0.5 + 0.5 * t
+            g = 0.5 * t
+            b = 1.0 * (1 - t)
+            
+            glColor3f(r, g, b) 
+            glScalef(0.6, height, 0.6)
+            glTranslatef(0, 0.5, 0) # pivot at bottom
+            self.draw_cube_fast()
+            glPopMatrix()
+            
+        self._disable_cube_vbo()
+
     def _create_cube_vbo(self):
         """Create Vertex Buffer Object for cube with normals"""
         # Cube vertices with normals (6 faces, 4 vertices each, 3 pos + 3 normal)
@@ -644,6 +810,7 @@ class Visualizer:
             if self.auto_rotate:
                 self.camera_rotation += self.ROTATION_SPEED
 
+            glRotatef(self.camera_pitch, 1, 0, 0)
             glRotatef(self.camera_rotation, 0, 1, 0)
 
             if self.mode == 0:
@@ -652,6 +819,8 @@ class Visualizer:
                 self.draw_terrain()
             elif self.mode == 2:
                 self.draw_circular(bands)
+            elif self.mode == 3:
+                self.draw_stereo_bars(bands)
 
             self.draw_text_overlay()
 

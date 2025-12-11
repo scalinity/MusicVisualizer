@@ -7,12 +7,13 @@ class AudioAnalyzer:
     SAMPLE_RATE = 44100
     CHUNK_SIZE = 1024
     AUDIO_FORMAT = pyaudio.paInt16
-    NUM_CHANNELS = 1
+    NUM_CHANNELS = 2
 
     # Frequency analysis constants
     NUM_FREQUENCY_BANDS = 64
     LOW_FREQ_CUTOFF_BINS = 2  # Skip first 2 FFT bins (~0-40Hz)
     SMOOTHING_FACTOR = 0.7
+    NOISE_THRESHOLD = 0.05
 
     def __init__(self, device_index=None):
         self.RATE = self.SAMPLE_RATE
@@ -29,7 +30,7 @@ class AudioAnalyzer:
 
         # Frequency bands configuration
         self.num_bands = self.NUM_FREQUENCY_BANDS
-        self.bands = np.zeros(self.num_bands)
+        self.bands = np.zeros((self.NUM_CHANNELS, self.num_bands))
         self.smoothing_factor = self.SMOOTHING_FACTOR
 
         # Pre-calculate Hanning window (same for every frame)
@@ -126,7 +127,7 @@ class AudioAnalyzer:
             print(f"Switching to device index: {device_index}")
             self._open_stream(device_index)
             # Reset bands to avoid artifacts
-            self.bands = np.zeros(self.num_bands)
+            self.bands = np.zeros((self.NUM_CHANNELS, self.num_bands))
 
     def _precalculate_band_ranges(self):
         """Pre-calculate frequency band bin ranges to avoid recalculation each frame"""
@@ -154,18 +155,43 @@ class AudioAnalyzer:
         try:
             # Read raw data
             data = self.stream.read(self.CHUNK, exception_on_overflow=False)
+            
+            # Convert to numpy array
+            # Data is interleaved [L, R, L, R...] for stereo
+            raw_data = np.frombuffer(data, dtype=np.int16)
+            
+            # Use safe reshape to avoid errors if buffer size mismatch (though unlikely with read(chunk))
+            if raw_data.size == 0:
+                 return np.zeros((self.CHANNELS, self.num_bands))
 
-            # Convert to numpy array and apply pre-calculated window
-            audio_data = np.frombuffer(data, dtype=np.int16) * self.window
+            # Reshape to (samples, channels)
+            # If mono, it will be (samples, 1). If stereo, (samples, 2)
+            try:
+                raw_data = raw_data.reshape(-1, self.CHANNELS)
+            except ValueError:
+                # Fallback if size doesn't match
+                return self.bands
 
-            # FFT and normalize (using pre-calculated factor)
-            fft_data = np.abs(np.fft.rfft(audio_data)) * self.fft_norm_factor
+            channels_bands = []
+            
+            for ch in range(self.CHANNELS):
+                # Apply window
+                audio_data = raw_data[:, ch] * self.window
+                
+                # FFT
+                fft_data = np.abs(np.fft.rfft(audio_data)) * self.fft_norm_factor
+                
+                # Bands
+                ch_bands = np.array([
+                    np.mean(fft_data[start:end]) if end < len(fft_data) else 0.0
+                    for start, end in self.band_ranges
+                ])
+                channels_bands.append(ch_bands)
+            
+            new_bands = np.stack(channels_bands) # Shape (2, 64)
 
-            # Aggregate into bands using pre-calculated ranges
-            new_bands = np.array([
-                np.mean(fft_data[start:end]) if end < len(fft_data) else 0.0
-                for start, end in self.band_ranges
-            ])
+            # Apply noise gate
+            new_bands[new_bands < self.NOISE_THRESHOLD] = 0
 
             # Exponential smoothing
             self.bands = self.bands * self.smoothing_factor + new_bands * (1 - self.smoothing_factor)
