@@ -169,10 +169,17 @@ class Visualizer:
         """Toggle between fullscreen and windowed mode"""
         self.fullscreen = not self.fullscreen
         if self.fullscreen:
-            # Get current display info for fullscreen resolution
-            display_info = pygame.display.Info()
-            self.width = display_info.current_w
-            self.height = display_info.current_h
+            # Get list of available fullscreen modes
+            modes = pygame.display.list_modes()
+            if modes and modes != -1:
+                # Use the largest available mode (first in list)
+                self.width, self.height = modes[0]
+            else:
+                # Fallback to display info
+                display_info = pygame.display.Info()
+                self.width = display_info.current_w
+                self.height = display_info.current_h
+
             self.screen = pygame.display.set_mode((self.width, self.height),
                                                   DOUBLEBUF | OPENGL | FULLSCREEN)
         else:
@@ -246,19 +253,22 @@ class Visualizer:
     def update(self):
         if self.paused:
             return self.history[-1] if self.history else np.zeros(64)
-            
+
         # Get audio data - stereo (2, 64)
         raw_stereo = self.analyzer.read_audio() * self.sensitivity
-        
-        # Force Symmetry: Average Left and Right channels
-        # This solves the "one side more active" issue for panned audio
-        stereo_mean = np.mean(raw_stereo, axis=0)
-        raw_stereo[0] = stereo_mean
-        raw_stereo[1] = stereo_mean
-        
+
+        # For stereo mode: Preserve true L/R separation for spatial audio
+        # For other modes: Force symmetry to avoid one-sided activity
+        if self.mode != self.MODE_STEREO:
+            # Force Symmetry: Average Left and Right channels
+            # This solves the "one side more active" issue for panned audio
+            stereo_mean = np.mean(raw_stereo, axis=0)
+            raw_stereo[0] = stereo_mean
+            raw_stereo[1] = stereo_mean
+
         # Smooth stereo bands
         bands_stereo = np.zeros_like(raw_stereo)
-        
+
         for ch in range(2):
             raw_bands = raw_stereo[ch]
             # Simple 3-point moving average for each channel
@@ -276,7 +286,7 @@ class Visualizer:
         # Update history with mono bands (for terrain)
         self.history.pop(0)
         self.history.append(mono_bands)
-        
+
         if self.mode == self.MODE_STEREO:
             return bands_stereo
         else:
